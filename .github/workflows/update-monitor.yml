@@ -1,0 +1,40 @@
+name: Update live monitor
+
+# 注意：排程觸發只會喺預設分支（main）上面跑；喺其他分支上面，
+# 呢個 workflow 只可以經 Actions tab 手動 workflow_dispatch 觸發，
+# 方便分支測試，唔會干擾正式監測版。
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: live-monitor-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Update monitor page
+        run: python3 scripts/update_monitor.py
+      - name: Commit back if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add index.html
+          if git diff --cached --quiet; then
+            echo "no changes"
+          else
+            git commit -m "live monitor: auto update $(date -u +%Y-%m-%dT%H:%M) UTC"
+            git push
+          fi
