@@ -157,7 +157,7 @@ def comp_status(comp):
         return "完場"
     if name == "STATUS_HALFTIME":
         return "半場"
-    if name == "STATUS_IN_PROGRESS":
+    if name in ("STATUS_IN_PROGRESS", "STATUS_FIRST_HALF", "STATUS_SECOND_HALF"):
         return f"進行中 {clock}".strip()
     if name in ("STATUS_POSTPONED", "STATUS_CANCELED", "STATUS_SUSPENDED"):
         return "延期／取消"
