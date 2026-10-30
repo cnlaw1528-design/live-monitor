@@ -5,6 +5,13 @@ Reads pool.json (repo root), fetches scores from ESPN's public scoreboard
 API (no key needed), computes status/hit per match, and writes index.html
 (repo root) only when the content changed.
 
+Matches ESPN cannot cover (no league slug, or no event found) fall back to
+Tipsme's public results page (https://tipsme.hk/zh-HK/results, no key, no
+account): one fetch per run, finished matches only. Tipsme's headline score
+is the 90-minute score even for cup ties decided on penalties (verified
+2026-10-30: Braga 2-2 Famalicao shows 2-2 with only a "Pen." marker), which
+is exactly what the pools count, so no shootout handling is needed.
+
 Discipline (same as the manual monitor):
 - A score/half-time figure is only trusted when the source actually
   provides it. Missing or ambiguous data -> "待核實", never a guess.
@@ -55,6 +62,94 @@ def accepted_names(pool_name):
     """Normalized names accepted for one pool team (itself + aliases)."""
     n = norm(pool_name)
     return {n} | ALIASES.get(n, set())
+
+
+TIPSME_RESULTS = "https://tipsme.hk/zh-HK/results"
+
+# Tipsme uses the same Chinese team names as pool.json (verified 2026-10-30
+# for Midtjylland/OB/Braga/Famalicao). If a variant is ever observed
+# (e.g. a one-character difference), add it here, same pattern as ALIASES.
+TIPSME_ALIASES = {}
+
+
+def tipsme_norm(name):
+    """Normalize a Chinese team name: strip all whitespace."""
+    return re.sub(r"\s+", "", str(name))
+
+
+def tipsme_accepted_names(pool_name):
+    n = tipsme_norm(pool_name)
+    return {n} | TIPSME_ALIASES.get(n, set())
+
+
+def fetch_tipsme_results():
+    """One fetch of Tipsme's public results page (server-rendered rows)."""
+    req = urllib.request.Request(TIPSME_RESULTS, headers=UA)
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return resp.read().decode("utf-8", "replace")
+    except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+        print(f"[warn] Tipsme fetch failed: {exc}")
+        return None
+
+
+def parse_tipsme_rows(html):
+    """Parse finished-result rows from Tipsme's results page.
+
+    Class names use the MatchRow_ prefix (the hash suffix after __ may
+    change on a frontend rebuild, so only the prefix is matched). Each row
+    carries: kickoff time, status, home team, home goals, away goals, away
+    team, league (from the home crest title "League, Team"), and HT score.
+    Rows without a full set of fields are dropped, never guessed.
+    """
+    rows = []
+    for seg in html.split('<div class="MatchRow_grid__')[1:]:
+        m = re.search(r'<span class="tabular-nums[^"]*">(\d{1,2}:\d{2})</span>', seg)
+        s = re.search(r'title="([^"]*)"><span class="truncate">([^<]*)</span>', seg)
+        h = re.search(r'MatchRow_home__[^"]*">.*?<span[^>]*>([^<]+)</span>', seg, re.DOTALL)
+        hg = re.search(r'MatchRow_homeGoals__[^"]*">(\d+)</span>', seg)
+        ag = re.search(r'MatchRow_awayGoals__[^"]*">(\d+)</span>', seg)
+        a = re.search(r'MatchRow_away__[^"]*">.*?<span[^>]*>([^<]+)</span>', seg, re.DOTALL)
+        lg = re.search(r'MatchRow_home__[^"]*">.*?<img[^>]*title="([^"]+)"', seg, re.DOTALL)
+        ht = re.search(r'HT.*?(\d+)\s*-\s*(\d+)', seg, re.DOTALL)
+        if not (m and s and h and hg and ag and a):
+            continue
+        league = lg.group(1).split(",", 1)[0].strip() if lg else ""
+        rows.append({
+            "time": m.group(1), "status": s.group(2).strip(),
+            "home": h.group(1).strip(), "away": a.group(1).strip(),
+            "league": league, "hg": int(hg.group(1)), "ag": int(ag.group(1)),
+            "ht": (int(ht.group(1)), int(ht.group(2))) if ht else None,
+        })
+    return rows
+
+
+def match_tipsme(rows, match):
+    """Strict-match one pool match to a finished Tipsme row, or None.
+
+    Gates (all required): status finished, both teams in the right home/away
+    roles (normalized, aliases accepted), and kickoff time-of-day matching
+    the pool kickoff in UTC or HKT (the page renders in viewer timezone;
+    the runner is UTC). The page is a rolling recent-results list with no
+    per-row date, so teams + time is the gate; if two rows match, the
+    league label breaks the tie, and a remaining tie means no match.
+    """
+    ko = datetime.fromisoformat(match["kickoff_hkt"])
+    times = {ko.strftime("%H:%M"),
+             ko.astimezone(timezone.utc).strftime("%H:%M")}
+    want_h = tipsme_accepted_names(match["home"])
+    want_a = tipsme_accepted_names(match["away"])
+    cands = [r for r in rows
+             if r["status"] == "完"
+             and tipsme_norm(r["home"]) in want_h
+             and tipsme_norm(r["away"]) in want_a
+             and r["time"] in times]
+    if len(cands) > 1:
+        lg = [r for r in cands if r["league"] == match.get("league", "")]
+        cands = lg if lg else cands
+    if len(cands) != 1:
+        return None
+    return cands[0]
 
 
 def espn_dates_for(kickoff_iso):
@@ -191,11 +286,29 @@ def comp_scores(comp):
     return out.get("home"), out.get("away")
 
 
-def build_rows(pool, boards):
+def finished_hit(m, ht, hs, aws):
+    """Hit string for a verified finished match (shared by ESPN/Tipsme)."""
+    ht_txt = f"{ht[0]}-{ht[1]}" if ht is not None else "—"
+    live_txt = f"{hs}-{aws}"
+    if m["pool"] == "ht":
+        if ht is not None:
+            if ht[0] != ht[1] and hs == aws:
+                route = "主-和" if ht[0] > ht[1] else "客-和"
+                return f"1（中{route}：半場 {ht_txt}，完場 {live_txt} 和波）"
+            return f"0（不中：半場 {ht_txt}，完場 {live_txt}）"
+        return "待核實（半場比數未核實）"
+    total = hs + aws
+    if total in (4, 5):
+        return f"1（中{total}球）"
+    return f"0（不中：總入球 {total} 球）"
+
+
+def build_rows(pool, boards, tipsme=None):
     """Return (ht_rows, goal_rows) as dicts ready for rendering."""
     ht_rows, goal_rows = [], []
     for m in pool["matches"]:
         comp = boards.get(m["fb"])
+        tip = (tipsme or {}).get(m["fb"])
         status = "待核實"
         ht_txt = live_txt = "—"
         total_txt = "—"
@@ -216,24 +329,20 @@ def build_rows(pool, boards):
             if status in ("未開波", "進行中", "半場") or status.startswith("進行中"):
                 hit = "待定"
             elif status == "完場" and verified_ft:
-                if m["pool"] == "ht":
-                    if ht is not None and ht_txt != "—":
-                        leader = ht[0] != ht[1]
-                        if leader and hs == aws:
-                            route = "主-和" if ht[0] > ht[1] else "客-和"
-                            hit = f"1（中{route}：半場 {ht_txt}，完場 {live_txt} 和波）"
-                        else:
-                            hit = f"0（不中：半場 {ht_txt}，完場 {live_txt}）"
-                    else:
-                        hit = "待核實（半場比數未核實）"
-                else:
-                    total = hs + aws
-                    if total in (4, 5):
-                        hit = f"1（中{total}球）"
-                    else:
-                        hit = f"0（不中：總入球 {total} 球）"
+                hit = finished_hit(m, ht, hs, aws)
             elif status == "完場":
                 hit = "待核實"
+        elif tip is not None:
+            # Tipsme fallback: finished match only, scores verified by the
+            # strict two-team + time match in match_tipsme.
+            status = "完場"
+            ht = tip["ht"]
+            hs, aws = tip["hg"], tip["ag"]
+            if ht is not None:
+                ht_txt = f"{ht[0]}-{ht[1]}"
+            live_txt = f"{hs}-{aws}"
+            total_txt = str(hs + aws)
+            hit = finished_hit(m, ht, hs, aws)
         row = {
             "fb": m["fb"], "match": f"{m['home']} vs {m['away']}",
             "ko": datetime.fromisoformat(m["kickoff_hkt"]).strftime("%m-%d %H:%M"),
@@ -366,7 +475,23 @@ def main():
             if comp is None:
                 print(f"[warn] no ESPN event for {m['fb']} {m['home']} vs {m['away']} ({league})")
             boards[m["fb"]] = comp
-    ht_rows, goal_rows = build_rows(pool, boards)
+    # Tipsme fallback, only for matches ESPN left unmatched, one page fetch.
+    unmatched = [m for m in pool["matches"] if boards.get(m["fb"]) is None]
+    tipsme = {}
+    if unmatched:
+        html = fetch_tipsme_results()
+        if html:
+            rows = parse_tipsme_rows(html)
+            print(f"[note] Tipsme results page: {len(rows)} finished rows parsed")
+            for m in unmatched:
+                r = match_tipsme(rows, m)
+                if r is None:
+                    print(f"[warn] no Tipsme row for {m['fb']} {m['home']} vs {m['away']}")
+                else:
+                    tipsme[m["fb"]] = r
+                    print(f"[note] Tipsme fallback {m['fb']} {m['home']} vs {m['away']}: "
+                          f"{r['hg']}-{r['ag']} HT {r['ht']}")
+    ht_rows, goal_rows = build_rows(pool, boards, tipsme)
     updated = datetime.now(timezone.utc).astimezone(HKT).strftime("%Y-%m-%d %H:%M HKT")
     page = render(pool, ht_rows, goal_rows, updated)
     for r in ht_rows + goal_rows:
@@ -381,3 +506,4 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+
