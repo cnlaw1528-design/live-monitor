@@ -43,6 +43,20 @@ def norm(name):
     return s
 
 
+# ESPN sometimes lists a team under a different name than the pool's
+# espn_home/espn_away (verified 2026-10-30: ESPN uses "Atlético-MG" for
+# Atlético Mineiro). Accepted spellings are keyed by normalized pool name.
+ALIASES = {
+    "atleticomineiro": {"atleticomg", "cam"},
+}
+
+
+def accepted_names(pool_name):
+    """Normalized names accepted for one pool team (itself + aliases)."""
+    n = norm(pool_name)
+    return {n} | ALIASES.get(n, set())
+
+
 def espn_dates_for(kickoff_iso):
     """ESPN scoreboard dates to try for one match (HKT date and day before,
     because ESPN's date bucket is US-time based)."""
@@ -117,7 +131,8 @@ def match_event(events, match):
     'R Huelva' (Recreativo Huelva) without letting 'Rayo' grab
     'Rayo Majadahonda' when the real 'Rayo' fixture is closer in time.
     """
-    want_h, want_a = norm(match["espn_home"]), norm(match["espn_away"])
+    want_h = accepted_names(match["espn_home"])
+    want_a = accepted_names(match["espn_away"])
     kickoff = datetime.fromisoformat(match["kickoff_hkt"])
     cands = []
     for ev in events:
@@ -131,9 +146,9 @@ def match_event(events, match):
             cands_names.discard("")
             names[c.get("homeAway")] = cands_names
         hs, aws = names.get("home", set()), names.get("away", set())
-        exact = want_h in hs and want_a in aws
-        sub = (any(want_h in n or n in want_h for n in hs)
-               and any(want_a in n or n in want_a for n in aws))
+        exact = bool(want_h & hs) and bool(want_a & aws)
+        sub = (any(w in n or n in w for w in want_h for n in hs)
+               and any(w in n or n in w for w in want_a for n in aws))
         if not (exact or sub):
             continue
         try:
