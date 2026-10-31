@@ -66,10 +66,18 @@ def accepted_names(pool_name):
 
 TIPSME_RESULTS = "https://tipsme.hk/zh-HK/results"
 
-# Tipsme uses the same Chinese team names as pool.json (verified 2026-10-30
-# for Midtjylland/OB/Braga/Famalicao). If a variant is ever observed
-# (e.g. a one-character difference), add it here, same pattern as ALIASES.
-TIPSME_ALIASES = {}
+# Tipsme's results page usually uses the same Chinese team names as
+# pool.json (verified 2026-10-30 for Midtjylland/OB/Braga/Famalicao), but
+# Qatar teams appear there under short names (verified 2026-10-31: the
+# results page listed Al Sadd as 沙德, Al Shamal as 舒馬爾, Al-Gharafa as
+# 多哈加拉法, while team/match pages use the full names). That mismatch
+# left FB8070/FB8069 stuck on 待核實 all night in R9. Variants go here,
+# same pattern as ALIASES, keyed by normalized pool name.
+TIPSME_ALIASES = {
+    "艾薩德": {"沙德"},
+    "艾沙瑪": {"舒馬爾"},
+    "艾加拉法": {"多哈加拉法"},
+}
 
 
 def tipsme_norm(name):
